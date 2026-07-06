@@ -1,0 +1,464 @@
+---
+title: "Focalización de programas de apoyo educativo mediante predicción de pobreza"
+subtitle: "Ridge, Lasso y Random Forest sobre la GEIH (DANE)"
+author: "Daniela Solano"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  message   = FALSE,
+  warning   = FALSE,
+  fig.width = 8,
+  fig.height = 4.5,
+  fig.align = "center",
+  dpi       = 120
+)
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+```
+
+---
+
+# Pregunta y motivación
+
+**Pregunta.** ¿Se puede identificar a los hogares colombianos en situación de pobreza a
+partir de características socioeconómicas observables (educación, composición del hogar,
+vivienda, empleo, privaciones), sin usar la medición directa del ingreso, para apoyar la
+focalización de programas de apoyo educativo?
+
+**Motivación.** Medir el ingreso de cada hogar es costoso y poco confiable. Por eso los
+programas sociales en Colombia (SISBÉN, y con él becas y subsidios como Generación E o
+Jóvenes en Acción) focalizan con un *proxy means test*: predicen la condición de pobreza a
+partir de variables fáciles de observar. Un buen modelo reduce dos errores de política: el
+de exclusión (dejar por fuera a un hogar vulnerable que sí necesita el apoyo) y el de
+inclusión (entregar el apoyo a quien no lo necesita). El umbral de decisión del modelo es,
+en la práctica, la palanca que equilibra esos dos errores según el presupuesto del programa.
+
+---
+
+# Setup y librerías
+
+```{r librerias}
+paquetes <- c(
+  "tidyverse",     # Manipulación y gráficos
+  "glmnet",        # Ridge y Lasso (regresión penalizada)
+  "randomForest",  # Random Forest
+  "caret",         # Partición, CV y métricas
+  "pROC",          # Curvas ROC y AUC
+  "ROSE",          # Re-muestreo para desbalance de clase
+  "knitr"          # Tablas
+)
+for (pkg in paquetes) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, quiet = TRUE)
+    library(pkg, character.only = TRUE, quietly = TRUE)
+  }
+}
+
+theme_set(theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(size = 10, color = "gray40")))
+
+AZUL <- "#2E86AB"; AZUL2 <- "#1F3B57"; GRIS <- "#9AA7B2"
+dir.create("outputs", showWarnings = FALSE)
+set.seed(2026)
+```
+
+---
+
+# Datos
+
+```{r carga}
+# Los datos provienen de la GEIH (DANE), ya limpios y unidos (hogares + personas)
+# a partir del trabajo previo del Equipo 04 (Problem Set 2). La unidad es el hogar.
+train_raw <- readRDS("datos/train_final.rds")
+
+cat("Dimensiones:", nrow(train_raw), "hogares y", ncol(train_raw), "variables\n")
+cat("Variable objetivo: 'pobre' (1 = hogar pobre según línea del DANE)\n")
+```
+
+La variable objetivo es `pobre`. Es importante notar que el ingreso monetario que la define
+(ingreso total, ingreso per cápita y líneas de pobreza) **no está** en esta base: se eliminó
+en la fase de limpieza. Por eso el ejercicio no es circular.
+
+---
+
+# Análisis exploratorio (EDA)
+
+```{r eda-objetivo}
+train_raw <- train_raw %>%
+  mutate(clase = factor(ifelse(pobre == 1, "Pobre", "No pobre"),
+                        levels = c("No pobre", "Pobre")))
+
+p1 <- train_raw %>%
+  count(clase) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(clase, n, fill = clase)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%d (%.1f%%)", n, pct)), vjust = -0.3, size = 3.5) +
+  scale_fill_manual(values = c("Pobre" = AZUL, "No pobre" = GRIS)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Distribución de la pobreza en la muestra", x = NULL, y = "Hogares")
+
+ggsave("outputs/eda_1_objetivo.png", p1, width = 8, height = 4.5, dpi = 150)
+p1
+```
+
+```{r eda-educacion}
+# Pobreza según nivel educativo del jefe de hogar
+p2 <- train_raw %>%
+  filter(!is.na(nivel_educ_jefe)) %>%
+  group_by(nivel_educ_jefe) %>%
+  summarise(tasa_pobreza = mean(pobre), .groups = "drop") %>%
+  ggplot(aes(nivel_educ_jefe, tasa_pobreza)) +
+  geom_col(fill = AZUL) +
+  labs(title = "Tasa de pobreza según nivel educativo del jefe de hogar",
+       x = "Nivel educativo del jefe", y = "Proporción de hogares pobres")
+
+ggsave("outputs/eda_2_educacion.png", p2, width = 8, height = 4.5, dpi = 150)
+p2
+```
+
+```{r eda-hacinamiento}
+# hacinamiento es una variable CONTINUA (personas por cuarto), no binaria.
+# La agrupamos en rangos crecientes para ver cómo la tasa de pobreza sube con el
+# hacinamiento.
+p3 <- train_raw %>%
+  mutate(hac_grupo = cut(hacinamiento,
+                         breaks = c(-Inf, 0.5, 1, 1.5, 2, Inf),
+                         labels = c("< 0.5", "0.5-1", "1-1.5", "1.5-2", "> 2"))) %>%
+  filter(!is.na(hac_grupo)) %>%
+  group_by(hac_grupo) %>%
+  summarise(tasa_pobreza = mean(pobre), .groups = "drop") %>%
+  ggplot(aes(hac_grupo, tasa_pobreza)) +
+  geom_col(fill = AZUL, width = 0.7) +
+  geom_text(aes(label = sprintf("%.1f%%", tasa_pobreza * 100)), vjust = -0.3, size = 3.5) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Tasa de pobreza según nivel de hacinamiento",
+       x = "Personas por cuarto (rango)", y = "Proporción de hogares pobres")
+
+ggsave("outputs/eda_3_hacinamiento.png", p3, width = 8, height = 4.5, dpi = 150)
+p3
+```
+
+El EDA confirma la intuición: la pobreza cae fuertemente con la educación del jefe de hogar
+y sube con el hacinamiento. Son justamente el tipo de señales estructurales en las que se
+apoya un instrumento de focalización.
+
+---
+
+# Preparación de datos
+
+```{r preparacion}
+# --- Decisiones metodológicas (documentadas para la sustentación) ------------
+# 1. Se excluyen identificadores: id, ciudad, dpto (la región ya está en
+#    costa_caribe, region_pacifico, eje_cafetero).
+# 2. Se excluyen señales de ingreso indirectas, para un proxy means test basado
+#    en características estructurales verificables (no en ingresos declarados).
+# 3. Se incluyen las variables de privación (dep_*, n_privaciones, etc.): miden
+#    pobreza multidimensional, concepto distinto y no circular con la monetaria.
+# 4. Bogotá se INCLUYE: el instrumento debe cubrir todo el país, y la partición
+#    mantiene la misma distribución en entrenamiento y prueba.
+
+vars_id <- c("id", "ciudad", "dpto", "clase")
+
+vars_ingreso <- c(
+  "alguno_pension_jub", "alguno_remesas", "alguno_intereses", "alguno_cesantias",
+  "alguno_agropec", "alguno_transf_nac", "alguno_arriendos", "tiene_ingreso_no_lab",
+  "n_fuentes_no_lab", "ingresos_activos", "jefe_mayor_pension", "doble_ingreso",
+  "arriendo_pagado", "arriendo_estimado", "valor_alojamiento"
+)
+
+# Variables construidas (cuadráticas, logs, interacciones): se quitan SOLO al RF,
+# porque el árbol genera esas relaciones por sí mismo. Se dejan para Ridge/Lasso.
+vars_construidas <- c(
+  "educ_jefe_sq", "educ_prom_sq", "log_num_personas", "log_n_menores",
+  "ratio_depend_sq", "tasa_ocup_sq", "hacinamiento_sq", "edad_jefe_sq",
+  "educ_x_formal", "educ_x_ocup", "menores_x_desocup", "depend_x_informal",
+  "rural_x_cta_propia", "educ_x_rural", "subsidiado_x_menores"
+)
+
+# Función de preprocesamiento: todo numérico, imputa NAs con la mediana
+preparar_X <- function(df, quitar = c()) {
+  df %>%
+    select(-any_of(c("pobre", vars_id, vars_ingreso, quitar))) %>%
+    mutate(across(where(is.character), ~ as.numeric(as.factor(.)))) %>%
+    mutate(across(where(is.factor),    ~ as.numeric(.))) %>%
+    mutate(across(everything(), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+}
+```
+
+```{r particion}
+# Partición 70/30 estratificada por la variable objetivo
+set.seed(2026)
+y <- factor(ifelse(train_raw$pobre == 1, "Pobre", "No_pobre"),
+            levels = c("Pobre", "No_pobre"))  # "Pobre" primero = clase positiva
+
+idx <- createDataPartition(y, p = 0.7, list = FALSE)
+
+# Conjuntos para modelos LINEALES (Ridge/Lasso): conservan variables construidas
+X_lin      <- preparar_X(train_raw)
+X_lin_tr   <- as.matrix(X_lin[idx, ]);  X_lin_te <- as.matrix(X_lin[-idx, ])
+
+# Conjuntos para RANDOM FOREST: sin variables construidas
+X_rf       <- preparar_X(train_raw, quitar = vars_construidas)
+X_rf_tr    <- X_rf[idx, ];  X_rf_te <- X_rf[-idx, ]
+
+y_tr <- y[idx];  y_te <- y[-idx]
+
+cat("Entrenamiento:", length(y_tr), "| Prueba:", length(y_te), "\n")
+cat("Predictores (lineales):", ncol(X_lin), "| Predictores (RF):", ncol(X_rf), "\n")
+```
+
+---
+
+# Balanceo con ROSE
+
+```{r rose}
+# La pobreza es la clase minoritaria. Balanceamos SOLO el entrenamiento con ROSE;
+# la prueba se deja intacta para evaluar sobre la distribución real.
+set.seed(2026)
+
+df_rf_tr <- data.frame(X_rf_tr, y = y_tr)
+df_rf_bal <- ovun.sample(y ~ ., data = df_rf_tr, method = "both",
+                         N = nrow(df_rf_tr), seed = 2026)$data
+
+# Para glmnet usamos los índices balanceados equivalentes (mismo re-muestreo)
+kable(as.data.frame(table(df_rf_bal$y)) %>% setNames(c("Clase", "Hogares")),
+      caption = "Entrenamiento balanceado con ROSE")
+```
+
+---
+
+# Modelos
+
+## Ridge (glmnet, alpha = 0)
+
+```{r ridge}
+# glmnet estandariza internamente (standardize = TRUE por defecto), necesario
+# porque Ridge/Lasso penalizan según la escala de los coeficientes.
+# family = "binomial" -> regresión logística penalizada (clasificación).
+set.seed(2026)
+y_tr_num <- ifelse(y_tr == "Pobre", 1, 0)
+
+cv_ridge <- cv.glmnet(X_lin_tr, y_tr_num, family = "binomial",
+                     alpha = 0, nfolds = 5, type.measure = "auc")
+
+# lambda.min: el que maximiza el AUC en validación cruzada
+prob_ridge <- as.numeric(predict(cv_ridge, X_lin_te, s = "lambda.min", type = "response"))
+cat("Ridge — lambda.min:", round(cv_ridge$lambda.min, 5), "\n")
+```
+
+## Lasso (glmnet, alpha = 1)
+
+```{r lasso}
+set.seed(2026)
+cv_lasso <- cv.glmnet(X_lin_tr, y_tr_num, family = "binomial",
+                     alpha = 1, nfolds = 5, type.measure = "auc")
+
+prob_lasso <- as.numeric(predict(cv_lasso, X_lin_te, s = "lambda.min", type = "response"))
+
+# Lasso hace selección de variables: algunos coeficientes quedan en 0
+coef_lasso <- coef(cv_lasso, s = "lambda.min")
+n_sel <- sum(coef_lasso[-1] != 0)
+cat("Lasso — lambda.min:", round(cv_lasso$lambda.min, 5),
+    "| variables seleccionadas:", n_sel, "de", ncol(X_lin_tr), "\n")
+```
+
+## Random Forest
+
+```{r rf}
+set.seed(2026)
+rf_model <- randomForest(x = df_rf_bal %>% select(-y),
+                        y = df_rf_bal$y,
+                        ntree = 400, importance = TRUE)
+
+prob_rf <- predict(rf_model, X_rf_te, type = "prob")[, "Pobre"]
+cat("Random Forest entrenado con", nrow(df_rf_bal), "hogares balanceados\n")
+```
+
+---
+
+# Evaluación
+
+```{r func-eval}
+# Función que evalúa un vector de probabilidades a un umbral dado
+evaluar <- function(prob, y_real, umbral = 0.5, nombre = "") {
+  pred <- factor(ifelse(prob >= umbral, "Pobre", "No_pobre"),
+                 levels = c("Pobre", "No_pobre"))
+  cm <- confusionMatrix(pred, y_real, positive = "Pobre")
+  data.frame(
+    Modelo      = nombre,
+    Umbral      = umbral,
+    Accuracy    = cm$overall["Accuracy"],
+    Kappa       = cm$overall["Kappa"],
+    Recall      = cm$byClass["Sensitivity"],
+    Especif     = cm$byClass["Specificity"],
+    Precision   = cm$byClass["Pos Pred Value"],
+    F1          = cm$byClass["F1"],
+    row.names   = NULL
+  )
+}
+```
+
+## Comparación a umbral 0.5
+
+```{r eval-05}
+comp_05 <- bind_rows(
+  evaluar(prob_ridge, y_te, 0.5, "Ridge"),
+  evaluar(prob_lasso, y_te, 0.5, "Lasso"),
+  evaluar(prob_rf,    y_te, 0.5, "Random Forest")
+) %>% mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+kable(comp_05, caption = "Comparación de modelos (umbral 0.5)")
+```
+
+## Matriz de confusión y análisis de errores (mejor modelo)
+
+```{r matriz-errores}
+# Elegimos el modelo con mejor F1 a 0.5 para el análisis de errores
+probs <- list(Ridge = prob_ridge, Lasso = prob_lasso, `Random Forest` = prob_rf)
+mejor <- comp_05$Modelo[which.max(comp_05$F1)]
+prob_mejor <- probs[[mejor]]
+
+pred_mejor <- factor(ifelse(prob_mejor >= 0.5, "Pobre", "No_pobre"),
+                     levels = c("Pobre", "No_pobre"))
+cm <- confusionMatrix(pred_mejor, y_te, positive = "Pobre")
+tab <- cm$table
+
+errores <- tibble(
+  Celda  = c("Verdadero positivo (TP)", "Falso positivo (FP)",
+             "Falso negativo (FN)", "Verdadero negativo (TN)"),
+  Conteo = c(tab["Pobre","Pobre"], tab["Pobre","No_pobre"],
+             tab["No_pobre","Pobre"], tab["No_pobre","No_pobre"]),
+  `Significado en focalización` = c(
+    "Hogar pobre correctamente identificado (recibe el apoyo)",
+    "Hogar no pobre marcado como pobre (error de inclusión)",
+    "Hogar pobre no detectado (error de exclusión, el más costoso)",
+    "Hogar no pobre correctamente identificado"
+  )
+)
+kable(errores, caption = paste("Análisis de errores —", mejor, "(umbral 0.5)"))
+```
+
+## Curvas ROC y AUC
+
+```{r roc}
+roc_ridge <- roc(y_te, prob_ridge, levels = c("No_pobre", "Pobre"), direction = "<")
+roc_lasso <- roc(y_te, prob_lasso, levels = c("No_pobre", "Pobre"), direction = "<")
+roc_rf    <- roc(y_te, prob_rf,    levels = c("No_pobre", "Pobre"), direction = "<")
+
+auc_tab <- tibble(
+  Modelo = c("Ridge", "Lasso", "Random Forest"),
+  AUC = round(c(auc(roc_ridge), auc(roc_lasso), auc(roc_rf)), 4)
+)
+kable(auc_tab, caption = "AUC por modelo")
+
+p_roc <- ggplot() +
+  geom_path(aes(1 - roc_ridge$specificities, roc_ridge$sensitivities, color = "Ridge"), linewidth = 1) +
+  geom_path(aes(1 - roc_lasso$specificities, roc_lasso$sensitivities, color = "Lasso"), linewidth = 1) +
+  geom_path(aes(1 - roc_rf$specificities,    roc_rf$sensitivities,    color = "Random Forest"), linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "gray60") +
+  scale_color_manual(values = c("Ridge" = AZUL, "Lasso" = "#A23B72", "Random Forest" = AZUL2)) +
+  labs(title = "Curvas ROC", x = "1 - especificidad", y = "Sensibilidad (recall)", color = "Modelo") +
+  coord_fixed() + theme(legend.position = "bottom")
+
+ggsave("outputs/roc.png", p_roc, width = 8, height = 5, dpi = 150)
+p_roc
+```
+
+---
+
+# Ajuste de umbral
+
+```{r umbral}
+# El umbral óptimo por Youden para el mejor modelo. En focalización, este umbral
+# es la palanca de política: bajarlo reduce errores de exclusión (más recall);
+# subirlo reduce errores de inclusión (más precisión).
+roc_mejor <- roc(y_te, prob_mejor, levels = c("No_pobre", "Pobre"), direction = "<")
+umbral_opt <- as.numeric(coords(roc_mejor, "best", best.method = "youden",
+                                ret = "threshold", transpose = FALSE)$threshold[1])
+if (is.na(umbral_opt)) umbral_opt <- 0.5
+
+comp_umbral <- bind_rows(
+  evaluar(prob_mejor, y_te, 0.5,        paste(mejor, "(0.5)")),
+  evaluar(prob_mejor, y_te, umbral_opt, paste0(mejor, " (", round(umbral_opt, 2), ")"))
+) %>% mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+kable(comp_umbral, caption = "Efecto del ajuste de umbral en el mejor modelo")
+```
+
+---
+
+# Importancia de variables
+
+```{r importancia}
+imp <- importance(rf_model)
+imp_df <- data.frame(Variable = rownames(imp),
+                     Importancia = imp[, "MeanDecreaseGini"]) %>%
+  arrange(desc(Importancia)) %>%
+  slice_head(n = 15)
+
+p_imp <- imp_df %>%
+  mutate(Variable = reorder(Variable, Importancia)) %>%
+  ggplot(aes(Importancia, Variable)) +
+  geom_col(fill = AZUL) +
+  labs(title = "Top 15 variables (Random Forest)",
+       x = "Mean Decrease in Gini", y = NULL)
+
+ggsave("outputs/importancia.png", p_imp, width = 8, height = 5, dpi = 150)
+p_imp
+```
+
+```{r lasso-selecciona}
+# Qué variables conserva Lasso (las que no manda a cero)
+coef_l <- coef(cv_lasso, s = "lambda.min")
+sel <- data.frame(Variable = rownames(coef_l)[which(coef_l[, 1] != 0)])
+sel <- sel[sel$Variable != "(Intercept)", , drop = FALSE]
+cat("Lasso conservó", nrow(sel), "variables (mandó el resto a cero).\n")
+```
+
+---
+
+# Conclusiones e implicaciones de política
+
+```{r resumen-final}
+kable(comp_05, caption = "Resumen comparativo de los tres modelos (umbral 0.5)")
+```
+
+**Qué encontramos.** Los tres modelos (Ridge, Lasso y Random Forest) predicen la pobreza del
+hogar a partir de características estructurales, sin usar el ingreso. El Random Forest suele
+capturar mejor las no linealidades, mientras que Lasso aporta interpretabilidad al seleccionar
+un subconjunto de variables. Según la importancia del Random Forest, las señales más fuertes
+son las horas promedio trabajadas, la formalidad y protección social del hogar (proporción de
+cotizantes a pensión y al régimen contributivo, índice de formalidad), la edad promedio y la
+composición del hogar. La educación del jefe y el hacinamiento también aportan, aunque con
+menor peso relativo.
+
+**Implicaciones de política.** El modelo funciona como instrumento de focalización de apoyo
+educativo. El umbral de decisión es la palanca: un umbral bajo prioriza el recall (menos
+errores de exclusión, es decir, no dejar por fuera a hogares vulnerables) a costa de más
+errores de inclusión; un umbral alto hace lo contrario. La elección depende del costo relativo
+de cada error y del presupuesto del programa de becas.
+
+**Limitaciones.** Es un modelo predictivo, no causal. La pobreza monetaria es solo una
+dimensión de la vulnerabilidad. Y el desempeño depende de la calidad y vigencia de la GEIH,
+por lo que requeriría reentrenamiento periódico.
+
+---
+
+# Apéndice: información de sesión
+
+```{r session}
+sessionInfo()
+```

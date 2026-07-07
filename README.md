@@ -35,9 +35,6 @@ necesita).
 - **Nota:** el ingreso monetario que define la pobreza (ingreso total, per cápita y líneas)
   no está en la base; se eliminó en la limpieza. Por eso el ejercicio no es circular.
 
-Los datos provienen del trabajo previo del Equipo 04 (Problem Set 2). Este taller es un
-desarrollo individual sobre esa base.
-
 ---
 
 ## Modelos

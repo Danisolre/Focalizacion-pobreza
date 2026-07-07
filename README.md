@@ -67,6 +67,12 @@ a partir de la curva ROC.
 El script lee los datos desde `datos/train_final.rds`, corre el análisis completo y genera
 el reporte `taller_focalizacion.html`, además de guardar las gráficas en `outputs/`.
 
+## Reporte HTML
+
+El reporte reproducible generado desde el archivo `taller_focalizacion.Rmd` puede visualizarse en el siguiente enlace:
+
+📄 [Ver reporte HTML renderizado](https://htmlpreview.github.io/?https://github.com/Danisolre/Focalizacion-pobreza/blob/main/taller_focalizacion.html)
+
 ---
 
 ## Estructura del repositorio

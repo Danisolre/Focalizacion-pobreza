@@ -79,8 +79,8 @@ set.seed(2026)
 # Datos
 
 ```{r carga}
-# Los datos provienen de la GEIH (DANE), ya limpios y unidos (hogares + personas)
-# a partir del trabajo previo del Equipo 04 (Problem Set 2). La unidad es el hogar.
+# Datos de la GEIH (DANE) procesados a nivel de hogar (train_final.rds).
+# La unidad de observación es el hogar.
 train_raw <- readRDS("datos/train_final.rds")
 
 cat("Dimensiones:", nrow(train_raw), "hogares y", ncol(train_raw), "variables\n")

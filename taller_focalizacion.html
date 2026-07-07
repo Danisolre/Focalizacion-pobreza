@@ -1725,8 +1725,8 @@ según el presupuesto del programa.</p>
 </div>
 <div id="datos" class="section level1" number="3">
 <h1><span class="header-section-number">3</span> Datos</h1>
-<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="co"># Los datos provienen de la GEIH (DANE), ya limpios y unidos (hogares + personas)</span></span>
-<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a><span class="co"># a partir del trabajo previo del Equipo 04 (Problem Set 2). La unidad es el hogar.</span></span>
+<div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="co"># Datos de la GEIH (DANE) procesados a nivel de hogar (train_final.rds).</span></span>
+<span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a><span class="co"># La unidad de observación es el hogar.</span></span>
 <span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>train_raw <span class="ot">&lt;-</span> <span class="fu">readRDS</span>(<span class="st">&quot;datos/train_final.rds&quot;</span>)</span>
 <span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a></span>
 <span id="cb2-5"><a href="#cb2-5" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Dimensiones:&quot;</span>, <span class="fu">nrow</span>(train_raw), <span class="st">&quot;hogares y&quot;</span>, <span class="fu">ncol</span>(train_raw), <span class="st">&quot;variables</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
